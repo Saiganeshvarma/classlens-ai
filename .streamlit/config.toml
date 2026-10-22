@@ -1,0 +1,7 @@
+[server]
+maxUploadSize = 500        # MB — matches MAX_FILE_SIZE_MB default
+enableXsrfProtection = true
+headless = true
+
+[browser]
+gatherUsageStats = false

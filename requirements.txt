@@ -1,0 +1,32 @@
+# ClassLens AI — Python 3.12 dependencies
+# Pin exact versions for reproducibility
+
+# Web interface
+streamlit==1.41.1
+
+# AI providers
+openai==1.58.1          # Whisper transcription + GPT-4o evaluation
+anthropic==0.42.0       # Optional: Claude alternative for evaluation
+
+# Video / audio processing
+opencv-python-headless==4.10.0.84
+pydub==0.25.1           # Audio manipulation helpers
+
+# Data validation
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# Environment / config
+python-dotenv==1.0.1
+
+# Charting
+plotly==5.24.1
+
+# Testing
+pytest==8.3.4
+pytest-mock==3.14.0
+
+# Utilities
+requests==2.32.3        # URL validation (allowlist-gated)
+numpy==2.2.0
+Pillow==11.1.0          # Frame image handling
