@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import textwrap
+import time
 from typing import List, Optional, Tuple
 
 from config import get_settings
@@ -201,8 +202,41 @@ def _format_evidence_for_prompt(pkg: EvidencePackage) -> str:
 
 # ── OpenAI evaluation ─────────────────────────────────────────────────────────
 
+def _call_openai_with_retry(client, model: str, messages: list, max_wait: int = 60) -> str:
+    """
+    Call the OpenAI chat completions API with one automatic retry on rate limit.
+    Returns the raw response text.
+    """
+    import openai
+
+    def _do_call():
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=4096,
+        )
+
+    try:
+        response = _do_call()
+        return response.choices[0].message.content or ""
+    except openai.RateLimitError:
+        logger.warning("Rate limit hit — waiting %ds before retry...", max_wait)
+        time.sleep(max_wait)
+        try:
+            response = _do_call()
+            return response.choices[0].message.content or ""
+        except openai.RateLimitError as exc2:
+            raise EvaluatorError(
+                "OpenAI rate limit reached even after waiting. "
+                "Try switching EVALUATION_MODEL=gpt-4o-mini in your .env for higher limits, "
+                "or wait a few minutes and retry."
+            ) from exc2
+
+
 def _evaluate_openai(evidence_text: str) -> dict:
-    """Call GPT-4o with the evidence and return parsed JSON dict."""
+    """Call GPT-4o (or configured model) with the evidence and return parsed JSON dict."""
     import openai  # local import
 
     settings = get_settings()
@@ -211,29 +245,26 @@ def _evaluate_openai(evidence_text: str) -> dict:
         timeout=settings.llm_timeout_seconds,
     )
 
-    user_message = (
-        "Please evaluate the following class recording evidence and return "
-        "your assessment as JSON matching the schema in the system prompt.\n\n"
-        + evidence_text
-    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Please evaluate the following class recording evidence and return "
+                "your assessment as JSON matching the schema in the system prompt.\n\n"
+                + evidence_text
+            ),
+        },
+    ]
 
     try:
-        response = client.chat.completions.create(
-            model=settings.evaluation_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,        # low temperature for consistent structured output
-            max_tokens=4096,
-        )
+        raw = _call_openai_with_retry(client, settings.evaluation_model, messages)
+    except EvaluatorError:
+        raise
     except openai.AuthenticationError as exc:
         raise EvaluatorError(
             "OpenAI authentication failed. Check your OPENAI_API_KEY."
         ) from exc
-    except openai.RateLimitError as exc:
-        raise EvaluatorError("OpenAI rate limit reached.") from exc
     except openai.APITimeoutError as exc:
         raise EvaluatorError(
             f"Evaluation timed out after {settings.llm_timeout_seconds}s."
@@ -241,7 +272,6 @@ def _evaluate_openai(evidence_text: str) -> dict:
     except openai.APIError as exc:
         raise EvaluatorError(f"OpenAI API error: {exc}") from exc
 
-    raw = response.choices[0].message.content
     if not raw:
         raise MalformedResponseError("LLM returned an empty response.")
 
@@ -251,6 +281,65 @@ def _evaluate_openai(evidence_text: str) -> dict:
         raise MalformedResponseError(
             f"LLM response is not valid JSON: {exc}\n"
             f"Raw response (first 500 chars): {raw[:500]}"
+        ) from exc
+
+
+# ── Gemini evaluation ─────────────────────────────────────────────────────────
+
+def _evaluate_gemini(evidence_text: str) -> dict:
+    """Call Google Gemini with the evidence and return parsed JSON dict."""
+    import google.generativeai as genai
+
+    settings = get_settings()
+    genai.configure(api_key=settings.gemini_api_key)
+
+    model = genai.GenerativeModel(
+        model_name=settings.evaluation_model,
+        system_instruction=SYSTEM_PROMPT,
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.2,
+            max_output_tokens=4096,
+            response_mime_type="application/json",
+        ),
+    )
+
+    user_message = (
+        "Please evaluate the following class recording evidence and return "
+        "your assessment as JSON matching the schema in the system prompt.\n\n"
+        + evidence_text
+    )
+
+    try:
+        response = model.generate_content(user_message)
+        raw = response.text
+    except Exception as exc:
+        err = str(exc).lower()
+        if "api_key" in err or "invalid" in err or "403" in err or "api key" in err or "authentication" in err:
+            raise EvaluatorError(
+                "Gemini authentication failed. Check your GEMINI_API_KEY in .env."
+            ) from exc
+        if "quota" in err or "rate" in err or "429" in err or "resource_exhausted" in err:
+            raise EvaluatorError(
+                "Gemini rate limit reached. Wait a moment and retry, "
+                "or check your quota at https://aistudio.google.com."
+            ) from exc
+        raise EvaluatorError(f"Gemini API error: {exc}") from exc
+
+    if not raw:
+        raise MalformedResponseError("Gemini returned an empty response.")
+
+    # Strip markdown fences if present
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MalformedResponseError(
+            f"Gemini response is not valid JSON: {exc}\n"
+            f"Raw (first 500): {raw[:500]}"
         ) from exc
 
 
@@ -569,7 +658,7 @@ def evaluate(
         )
 
     # Vision enrichment (best-effort — failure doesn't block evaluation)
-    if pkg.frames and pkg.video_available:
+    if pkg.frames and pkg.recording_metadata.video_available:
         transcript_snippet = (
             pkg.transcript.full_text[:500]
             if pkg.transcript and pkg.transcript.full_text
@@ -590,6 +679,8 @@ def evaluate(
         try:
             if settings.ai_provider == "openai":
                 raw_json = _evaluate_openai(evidence_text)
+            elif settings.ai_provider == "gemini":
+                raw_json = _evaluate_gemini(evidence_text)
             else:
                 raw_json = _evaluate_anthropic(evidence_text)
 

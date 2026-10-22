@@ -30,9 +30,10 @@ class Settings(BaseSettings):
     """
 
     # ── AI provider ───────────────────────────────────────────────
-    ai_provider: str = Field(default="openai", description="'openai' or 'anthropic'")
+    ai_provider: str = Field(default="openai", description="'openai' | 'anthropic' | 'gemini'")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     anthropic_api_key: Optional[str] = Field(default=None, alias="ANTHROPIC_API_KEY")
+    gemini_api_key: Optional[str] = Field(default=None, alias="GEMINI_API_KEY")
 
     transcription_model: str = Field(
         default="whisper-1",
@@ -88,7 +89,7 @@ class Settings(BaseSettings):
     @field_validator("ai_provider")
     @classmethod
     def validate_provider(cls, v: str) -> str:
-        allowed = {"openai", "anthropic"}
+        allowed = {"openai", "anthropic", "gemini"}
         v = v.lower().strip()
         if v not in allowed:
             raise ValueError(f"AI_PROVIDER must be one of {allowed}, got '{v}'.")
@@ -154,17 +155,19 @@ class Settings(BaseSettings):
             return bool(self.openai_api_key and self.openai_api_key.strip())
         if self.ai_provider == "anthropic":
             return bool(self.anthropic_api_key and self.anthropic_api_key.strip())
+        if self.ai_provider == "gemini":
+            return bool(self.gemini_api_key and self.gemini_api_key.strip())
         return False
 
     def transcription_ready(self) -> bool:
-        """True if transcription can be attempted (currently requires OpenAI)."""
-        return bool(self.openai_api_key and self.openai_api_key.strip())
+        """True if transcription can be attempted."""
+        if self.ai_provider == "gemini":
+            return bool(self.gemini_api_key and self.gemini_api_key.strip()
+                        and self.gemini_api_key != "your-gemini-api-key-here")
+        return bool(self.openai_api_key and self.openai_api_key.strip()
+                    and self.openai_api_key != "your-openai-api-key-here")
 
     def setup_errors(self) -> List[str]:
-        """
-        Returns a list of human-readable setup problems.
-        An empty list means the application is fully configured.
-        """
         errors: List[str] = []
         if not self.provider_ready():
             errors.append(
@@ -176,6 +179,12 @@ class Settings(BaseSettings):
                 "Anthropic is selected for evaluation but transcription still "
                 "requires OPENAI_API_KEY (Whisper). "
                 "Set OPENAI_API_KEY or switch AI_PROVIDER to 'openai'."
+            )
+        if self.ai_provider == "gemini" and not self.transcription_ready():
+            errors.append(
+                "Gemini is selected for evaluation but transcription still "
+                "requires OPENAI_API_KEY (Whisper). "
+                "Set OPENAI_API_KEY for transcription."
             )
         return errors
 

@@ -22,6 +22,9 @@ python-dotenv==1.0.1
 # Charting
 plotly==5.24.1
 
+# Google Gemini
+google-generativeai==0.8.3
+
 # Testing
 pytest==8.3.4
 pytest-mock==3.14.0

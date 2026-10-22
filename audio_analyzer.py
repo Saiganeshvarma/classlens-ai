@@ -133,14 +133,78 @@ def _transcribe_openai(audio_path: str) -> TranscriptResult:
     )
 
 
+def _transcribe_gemini(audio_path: str) -> TranscriptResult:
+    """
+    Transcribe audio using Google Gemini's multimodal API.
+    Gemini 1.5 Flash/Pro can process audio files directly.
+    Free tier: 15 RPM, 1500 requests/day — no billing required.
+    """
+    try:
+        import google.generativeai as genai
+    except ImportError as exc:
+        raise TranscriptionError(
+            "google-generativeai package not installed. Run: pip install google-generativeai"
+        ) from exc
+
+    settings = get_settings()
+    if not settings.gemini_api_key or settings.gemini_api_key == "your-gemini-api-key-here":
+        raise TranscriptionError(
+            "GEMINI_API_KEY is not configured. Set it in your .env file."
+        )
+
+    genai.configure(api_key=settings.gemini_api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    file_size = os.path.getsize(audio_path)
+    logger.info("Sending audio to Gemini for transcription (%.1f MB).", file_size / (1024*1024))
+
+    try:
+        audio_file = genai.upload_file(audio_path, mime_type="audio/wav")
+        response = model.generate_content([
+            audio_file,
+            (
+                "Please transcribe this audio recording completely and accurately. "
+                "Format your response as a plain transcript only — no timestamps, "
+                "no speaker labels, no commentary. Just the spoken words."
+            ),
+        ])
+        full_text = response.text.strip() if response.text else ""
+    except Exception as exc:
+        err = str(exc).lower()
+        if "quota" in err or "rate" in err or "429" in err:
+            raise TranscriptionError(
+                "Gemini rate limit reached during transcription. Wait a moment and retry."
+            ) from exc
+        if "api_key" in err or "invalid" in err or "403" in err:
+            raise TranscriptionError(
+                "Gemini authentication failed. Check your GEMINI_API_KEY."
+            ) from exc
+        raise TranscriptionError(f"Gemini transcription error: {exc}") from exc
+
+    if not full_text:
+        raise TranscriptionError("Gemini returned an empty transcript.")
+
+    word_count = len(full_text.split())
+    # Gemini doesn't return timestamps — create one segment for the full text
+    segments = [TranscriptSegment(start=0.0, end=0.0, text=full_text)]
+
+    logger.info("Gemini transcription complete: %d words.", word_count)
+    return TranscriptResult(
+        full_text=full_text,
+        segments=segments,
+        language=None,
+        word_count=word_count,
+    )
+
+
 # ── Public transcription entry point ─────────────────────────────────────────
 
 def transcribe_audio(audio_path: str) -> TranscriptResult:
     """
     Transcribe audio using the configured provider.
 
-    Currently only OpenAI Whisper is supported for transcription.
-    Raises TranscriptionError with a descriptive message on failure.
+    - OpenAI Whisper: requires OPENAI_API_KEY, best timestamp accuracy
+    - Gemini: requires GEMINI_API_KEY, free tier available, no timestamps
     """
     if not os.path.exists(audio_path):
         raise TranscriptionError(f"Audio file not found: '{audio_path}'")
@@ -149,13 +213,24 @@ def transcribe_audio(audio_path: str) -> TranscriptResult:
     if file_size == 0:
         raise TranscriptionError("Audio file is empty.")
 
-    # OpenAI Whisper has a 25 MB upload limit
+    settings = get_settings()
+
+    # Route to Gemini if that's the configured provider
+    if settings.ai_provider == "gemini":
+        return _transcribe_gemini(audio_path)
+
+    # OpenAI Whisper — 25 MB upload limit
     max_bytes = 25 * 1024 * 1024
     if file_size > max_bytes:
         raise TranscriptionError(
             f"Audio file is {file_size / (1024*1024):.1f} MB, which exceeds "
-            "Whisper's 25 MB limit. Consider trimming the recording or "
-            "splitting it into segments."
+            "Whisper's 25 MB limit."
+        )
+
+    if not settings.transcription_ready():
+        raise TranscriptionError(
+            "OPENAI_API_KEY is not configured. "
+            "Set it in your .env file to enable transcription."
         )
 
     return _transcribe_openai(audio_path)
