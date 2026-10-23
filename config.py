@@ -2,6 +2,7 @@
 config.py — Application configuration for ClassLens AI.
 
 Reads settings from environment variables (and a .env file when present).
+When running in Streamlit Cloud, also reads from st.secrets.
 Never exposes secret values; callers receive only boolean "is configured"
 flags when they need to check provider readiness.
 """
@@ -19,6 +20,18 @@ from pydantic_settings import BaseSettings
 
 # Load .env from the project root (silently ignored if the file is absent)
 load_dotenv(override=False)
+
+# Try to load Streamlit secrets if available (for Streamlit Cloud deployment)
+try:
+    import streamlit as st
+    # Copy Streamlit secrets to environment variables
+    if hasattr(st, 'secrets'):
+        for key, value in st.secrets.items():
+            if key not in os.environ:
+                os.environ[key] = str(value)
+except (ImportError, FileNotFoundError, AttributeError):
+    # Not running in Streamlit or secrets not configured - continue normally
+    pass
 
 
 class Settings(BaseSettings):
@@ -89,7 +102,7 @@ class Settings(BaseSettings):
     @field_validator("ai_provider")
     @classmethod
     def validate_provider(cls, v: str) -> str:
-        allowed = {"openai", "anthropic", "gemini"}
+        allowed = {"openai", "anthropic", "gemini", "ollama"}
         v = v.lower().strip()
         if v not in allowed:
             raise ValueError(f"AI_PROVIDER must be one of {allowed}, got '{v}'.")
@@ -157,13 +170,20 @@ class Settings(BaseSettings):
             return bool(self.anthropic_api_key and self.anthropic_api_key.strip())
         if self.ai_provider == "gemini":
             return bool(self.gemini_api_key and self.gemini_api_key.strip())
+        if self.ai_provider == "ollama":
+            return True  # Ollama runs locally, no API key needed
         return False
 
     def transcription_ready(self) -> bool:
         """True if transcription can be attempted."""
+        # For Ollama, we use local Whisper (always ready, no API key needed)
+        if self.ai_provider == "ollama":
+            return True
+        # For Gemini provider, check Gemini key
         if self.ai_provider == "gemini":
             return bool(self.gemini_api_key and self.gemini_api_key.strip()
                         and self.gemini_api_key != "your-gemini-api-key-here")
+        # For others (OpenAI, Anthropic), check OpenAI key
         return bool(self.openai_api_key and self.openai_api_key.strip()
                     and self.openai_api_key != "your-openai-api-key-here")
 
@@ -183,9 +203,10 @@ class Settings(BaseSettings):
         if self.ai_provider == "gemini" and not self.transcription_ready():
             errors.append(
                 "Gemini is selected for evaluation but transcription still "
-                "requires OPENAI_API_KEY (Whisper). "
-                "Set OPENAI_API_KEY for transcription."
+                "requires GEMINI_API_KEY. "
+                "Set GEMINI_API_KEY for transcription."
             )
+        # Ollama uses local Whisper, no API key needed for transcription
         return errors
 
     def dimension_weights(self) -> dict[str, float]:

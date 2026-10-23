@@ -56,7 +56,8 @@ def calculate_weighted_score(dimensions: List[DimensionAssessment]) -> Tuple[flo
       (the partial evidence is all we have).
     - Returns (rounded_score, list_of_warnings).
 
-    Raises ValueError if no dimension has a usable score.
+    If no dimensions are assessable, returns (0.0, warnings) instead of raising.
+    This allows the report to be generated with a "Poor" rating and clear explanation.
     """
     warnings: List[str] = []
     numerator = 0.0
@@ -78,10 +79,11 @@ def calculate_weighted_score(dimensions: List[DimensionAssessment]) -> Tuple[flo
         denominator += dim.weight
 
     if denominator == 0:
-        raise ValueError(
-            "No assessable dimensions found — cannot calculate an overall score. "
-            "The recording may lack sufficient usable content."
+        warnings.append(
+            "No assessable dimensions found. The recording lacks sufficient "
+            "usable content (no speech detected and/or no visual content)."
         )
+        return 0.0, warnings
 
     raw = numerator / denominator
     # Clamp to [0, 100] to absorb any floating-point edge cases

@@ -138,6 +138,140 @@ def _transcribe_gemini(audio_path: str) -> TranscriptResult:
     Transcribe audio using Google Gemini's multimodal API.
     Gemini 1.5 Flash/Pro can process audio files directly.
     Free tier: 15 RPM, 1500 requests/day — no billing required.
+    Note: File size limits may apply (~20MB typical).
+    """
+    try:
+        import google.generativeai as genai
+    except ImportError as exc:
+        raise TranscriptionError(
+            "google-generativeai package not installed. Run: pip install google-generativeai"
+        ) from exc
+
+    settings = get_settings()
+    if not settings.gemini_api_key or settings.gemini_api_key == "your-gemini-api-key-here":
+        raise TranscriptionError(
+            "GEMINI_API_KEY is not configured. Set it in your .env file."
+        )
+
+    genai.configure(api_key=settings.gemini_api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    file_size = os.path.getsize(audio_path)
+    logger.info("Sending audio to Gemini for transcription (%.1f MB).", file_size / (1024*1024))
+
+    # Gemini has file size limits, check and warn
+    max_size_mb = 20  # Conservative estimate
+    if file_size > max_size_mb * 1024 * 1024:
+        logger.warning(
+            "Audio file (%.1f MB) may exceed Gemini upload limits (~%d MB). "
+            "Consider using local Whisper for large files.",
+            file_size / (1024*1024), max_size_mb
+        )
+
+    try:
+        audio_file = genai.upload_file(audio_path, mime_type="audio/wav")
+        response = model.generate_content([
+            audio_file,
+            (
+                "Please transcribe this audio recording completely and accurately. "
+                "Format your response as a plain transcript only — no timestamps, "
+                "no speaker labels, no commentary. Just the spoken words."
+            ),
+        ])
+        full_text = response.text.strip() if response.text else ""
+    except Exception as exc:
+        err = str(exc).lower()
+        if "quota" in err or "rate" in err or "429" in err:
+            raise TranscriptionError(
+                "Gemini rate limit reached during transcription. Wait a moment and retry."
+            ) from exc
+        if "api_key" in err or "invalid" in err or "403" in err:
+            raise TranscriptionError(
+                "Gemini authentication failed. Check your GEMINI_API_KEY."
+            ) from exc
+        if "file" in err and ("too large" in err or "size" in err or "limit" in err):
+            raise TranscriptionError(
+                f"Audio file too large for Gemini (%.1f MB). "
+                "Install local Whisper: pip install openai-whisper" % (file_size / (1024*1024))
+            ) from exc
+        raise TranscriptionError(f"Gemini transcription error: {exc}") from exc
+
+    if not full_text:
+        raise TranscriptionError("Gemini returned an empty transcript.")
+
+    word_count = len(full_text.split())
+    # Gemini doesn't return timestamps — create one segment for the full text
+    segments = [TranscriptSegment(start=0.0, end=0.0, text=full_text)]
+
+    logger.info("Gemini transcription complete: %d words.", word_count)
+    return TranscriptResult(
+        full_text=full_text,
+        segments=segments,
+        language=None,
+        word_count=word_count,
+    )
+
+
+# ── Local Whisper transcription ──────────────────────────────────────────────
+
+def _transcribe_whisper_local(audio_path: str) -> TranscriptResult:
+    """
+    Transcribe audio using local Whisper model (completely free, no API needed).
+    Requires: pip install openai-whisper
+    Uses: base model (good balance of speed and accuracy)
+    """
+    try:
+        import whisper
+    except ImportError as exc:
+        raise TranscriptionError(
+            "openai-whisper package not installed. Run: pip install openai-whisper"
+        ) from exc
+
+    file_size = os.path.getsize(audio_path)
+    logger.info(
+        "Transcribing with local Whisper base model (%.1f MB). This may take a few minutes...",
+        file_size / (1024*1024)
+    )
+
+    try:
+        # Load model (cached after first use)
+        model = whisper.load_model("base")
+        
+        # Transcribe
+        result = model.transcribe(audio_path, verbose=False)
+        
+        full_text = result.get("text", "").strip()
+        language = result.get("language")
+        segments_data = result.get("segments", [])
+        
+        # Parse segments
+        segments: List[TranscriptSegment] = []
+        for seg in segments_data:
+            segments.append(TranscriptSegment(
+                start=float(seg.get("start", 0)),
+                end=float(seg.get("end", 0)),
+                text=str(seg.get("text", "")).strip(),
+            ))
+        
+        word_count = len(full_text.split())
+        logger.info("Local Whisper transcription complete: %d words, %d segments.", word_count, len(segments))
+        
+        return TranscriptResult(
+            full_text=full_text,
+            segments=segments,
+            language=language,
+            word_count=word_count,
+        )
+    
+    except Exception as exc:
+        raise TranscriptionError(f"Local Whisper transcription failed: {exc}") from exc
+
+
+def _transcribe_gemini(audio_path: str) -> TranscriptResult:
+    """
+    Transcribe audio using Google Gemini's multimodal API.
+    Gemini 1.5 Flash/Pro can process audio files directly.
+    Free tier: 15 RPM, 1500 requests/day — no billing required.
     """
     try:
         import google.generativeai as genai
@@ -203,8 +337,10 @@ def transcribe_audio(audio_path: str) -> TranscriptResult:
     """
     Transcribe audio using the configured provider.
 
-    - OpenAI Whisper: requires OPENAI_API_KEY, best timestamp accuracy
-    - Gemini: requires GEMINI_API_KEY, free tier available, no timestamps
+    - OpenAI Whisper API: requires OPENAI_API_KEY, best timestamp accuracy, 25MB limit
+    - Gemini API: requires GEMINI_API_KEY, free tier available, ~20MB limit, no timestamps
+    - Local Whisper: completely free, no API key needed, unlimited size, good accuracy
+    - For Gemini evaluation with local transcription: always use local Whisper
     """
     if not os.path.exists(audio_path):
         raise TranscriptionError(f"Audio file not found: '{audio_path}'")
@@ -215,10 +351,12 @@ def transcribe_audio(audio_path: str) -> TranscriptResult:
 
     settings = get_settings()
 
-    # Route to Gemini if that's the configured provider
-    if settings.ai_provider == "gemini":
-        return _transcribe_gemini(audio_path)
-
+    # For Ollama or Gemini evaluation: always use local Whisper for transcription
+    # (Keeps transcription free and avoids rate limits)
+    if settings.ai_provider in ["ollama", "gemini"]:
+        logger.info("Using local Whisper for transcription (free, unlimited)")
+        return _transcribe_whisper_local(audio_path)
+    
     # OpenAI Whisper — 25 MB upload limit
     max_bytes = 25 * 1024 * 1024
     if file_size > max_bytes:

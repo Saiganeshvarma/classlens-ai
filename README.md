@@ -58,8 +58,8 @@ Upload → validate_recording()
 | Component | Library / Tool |
 |-----------|---------------|
 | UI | Streamlit 1.41 |
-| Transcription | OpenAI Whisper (`whisper-1`) |
-| AI evaluation | OpenAI GPT-4o or Anthropic Claude |
+| Transcription | Local Whisper (free) or OpenAI Whisper API |
+| AI evaluation | Google Gemini, OpenAI GPT-4o, or Anthropic Claude |
 | Video processing | FFmpeg 9.x, OpenCV 4.10 |
 | Data validation | Pydantic v2, pydantic-settings |
 | Charts | Plotly |
@@ -75,7 +75,7 @@ Upload → validate_recording()
 
 - Python 3.12
 - FFmpeg (must be on `PATH`)
-- An OpenAI API key (required for transcription and evaluation)
+- A Google Gemini API key (free tier available) OR OpenAI API key
 
 ### Install FFmpeg (macOS)
 
@@ -122,19 +122,20 @@ Copy the example file and fill in your values:
 cp .env.example .env
 ```
 
-**Required:**
+**Required (choose one):**
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | OpenAI API key (required for Whisper + GPT-4o) |
+| `GEMINI_API_KEY` | Google Gemini API key (free tier available at https://aistudio.google.com) |
+| `OPENAI_API_KEY` | OpenAI API key (required if using OpenAI for transcription + evaluation) |
 
 **Optional / defaults:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AI_PROVIDER` | `openai` | `openai` or `anthropic` |
-| `EVALUATION_MODEL` | `gpt-4o` | LLM used for evaluation |
-| `TRANSCRIPTION_MODEL` | `whisper-1` | Whisper model |
+| `AI_PROVIDER` | `openai` | `gemini`, `openai`, or `anthropic` |
+| `EVALUATION_MODEL` | `gpt-4o` | LLM used for evaluation (`gemini-1.5-flash`, `gpt-4o`, etc.) |
+| `TRANSCRIPTION_MODEL` | `whisper-1` | Transcription model (auto-uses local Whisper for Gemini) |
 | `MAX_FILE_SIZE_MB` | `500` | Upload size cap |
 | `MAX_DURATION_SECONDS` | `3600` | Recording length cap |
 | `MAX_FRAMES` | `12` | Max video frames extracted |
@@ -143,11 +144,17 @@ cp .env.example .env
 | `THRESHOLD_AVERAGE_MAX` | `59` | Upper bound for Average rating |
 | `THRESHOLD_GOOD_MAX` | `79` | Upper bound for Good rating |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `LLM_TIMEOUT_SECONDS` | `120` | Timeout for LLM API calls |
 
 **If using Anthropic:**
 
 Set `AI_PROVIDER=anthropic` and `ANTHROPIC_API_KEY=sk-ant-...`.
 You still need `OPENAI_API_KEY` for Whisper transcription (Anthropic has no hosted ASR).
+
+**If using Gemini:**
+
+Set `AI_PROVIDER=gemini` and `GEMINI_API_KEY=AIza...`.
+Transcription automatically uses local Whisper (free, no API key needed).
 
 **Never commit `.env` to Git** — it is listed in `.gitignore`.
 
@@ -190,7 +197,18 @@ pytest tests/ --cov=. --cov-report=term-missing
 
 ## Configuring the AI Provider
 
-### OpenAI (default)
+### Google Gemini (recommended - free tier available)
+
+```bash
+# .env
+AI_PROVIDER=gemini
+GEMINI_API_KEY=AIza...
+EVALUATION_MODEL=gemini-1.5-flash
+```
+
+**Note:** When using Gemini, the app automatically uses local Whisper for transcription (completely free, no API key needed). Get your free Gemini API key at https://aistudio.google.com/app/apikey
+
+### OpenAI
 
 ```bash
 # .env
@@ -295,14 +313,33 @@ When a dimension cannot be assessed (e.g. no video stream, transcription failed)
 1. Push the repository to GitHub (without `.env`, recordings, or API keys).
 2. Go to https://share.streamlit.io and connect your repository.
 3. Set secrets via the Streamlit Cloud dashboard (Settings → Secrets):
+   
+   **For Gemini (recommended - free tier):**
    ```toml
+   AI_PROVIDER = "gemini"
+   GEMINI_API_KEY = "AIza..."
+   EVALUATION_MODEL = "gemini-1.5-flash"
+   TRANSCRIPTION_MODEL = "whisper-1"
+   MAX_FILE_SIZE_MB = 500
+   MAX_DURATION_SECONDS = 3600
+   MAX_FRAMES = 12
+   FRAME_INTERVAL_SECONDS = 30
+   LOG_LEVEL = "INFO"
+   LLM_TIMEOUT_SECONDS = 600
+   THRESHOLD_POOR_MAX = 39
+   THRESHOLD_AVERAGE_MAX = 59
+   THRESHOLD_GOOD_MAX = 79
+   ```
+   
+   **For OpenAI:**
+   ```toml
+   AI_PROVIDER = "openai"
    OPENAI_API_KEY = "sk-..."
+   EVALUATION_MODEL = "gpt-4o"
    ```
+
 4. Streamlit Cloud provides Python 3.12 and `pip install` from `requirements.txt` automatically.
-5. FFmpeg is available on Streamlit Cloud's Linux runners. If it is missing, add a `packages.txt` file:
-   ```
-   ffmpeg
-   ```
+5. FFmpeg is already configured in `packages.txt` for audio/video processing.
 
 ### Local / self-hosted
 

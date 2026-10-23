@@ -63,12 +63,13 @@ STRICT RULES:
 5. Do NOT assume high energy or constant talking equals excellent teaching.
 6. Do NOT assume silence means disengagement — it may be think time.
 7. Do NOT infer learning outcomes without supporting evidence.
-8. If a dimension cannot be assessed (e.g. no video available), set its status to "unavailable".
-9. Cite real timestamps from the evidence where available.
-10. Give specific, actionable improvement recommendations.
-11. Be honest about uncertainty and gaps.
-12. Do NOT calculate an overall score — the scoring engine handles that.
-13. Return ONLY valid JSON matching the schema below. No markdown, no prose outside JSON.
+8. If a dimension cannot be assessed (e.g. no video available, NO TRANSCRIPT, no audio), set its status to "unavailable".
+9. If the transcript shows 0 words, mark Teaching Clarity, Engagement, Lesson Structure, and Audio Intelligibility as "unavailable".
+10. Cite real timestamps from the evidence where available.
+11. Give specific, actionable improvement recommendations.
+12. Be honest about uncertainty and gaps.
+13. Do NOT calculate an overall score — the scoring engine handles that.
+14. Return ONLY valid JSON matching the schema below. No markdown, no prose outside JSON.
 
 REQUIRED JSON SCHEMA:
 {
@@ -284,11 +285,77 @@ def _evaluate_openai(evidence_text: str) -> dict:
         ) from exc
 
 
+# ── Ollama evaluation ─────────────────────────────────────────────────────────
+
+def _evaluate_ollama(evidence_text: str) -> dict:
+    """Call Ollama with the evidence and return parsed JSON dict."""
+    import requests
+
+    settings = get_settings()
+    
+    user_message = (
+        "Please evaluate the following class recording evidence and return "
+        "your assessment as JSON matching the schema in the system prompt.\n\n"
+        + evidence_text
+        + "\n\nReturn ONLY the JSON object, no other text."
+    )
+
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/chat",
+            json={
+                "model": settings.evaluation_model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message}
+                ],
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": 0.2,
+                    "num_predict": 4096,
+                }
+            },
+            timeout=settings.llm_timeout_seconds,
+        )
+        response.raise_for_status()
+        result = response.json()
+        raw = result.get("message", {}).get("content", "")
+    except requests.exceptions.ConnectionError as exc:
+        raise EvaluatorError(
+            "Cannot connect to Ollama. Make sure Ollama is running: ollama serve"
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise EvaluatorError(
+            f"Ollama request timed out after {settings.llm_timeout_seconds}s."
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise EvaluatorError(f"Ollama API error: {exc}") from exc
+
+    if not raw:
+        raise MalformedResponseError("Ollama returned an empty response.")
+
+    # Strip markdown fences if present
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MalformedResponseError(
+            f"Ollama response is not valid JSON: {exc}\n"
+            f"Raw (first 500): {raw[:500]}"
+        ) from exc
+
+
 # ── Gemini evaluation ─────────────────────────────────────────────────────────
 
 def _evaluate_gemini(evidence_text: str) -> dict:
     """Call Google Gemini with the evidence and return parsed JSON dict."""
     import google.generativeai as genai
+    import time
 
     settings = get_settings()
     genai.configure(api_key=settings.gemini_api_key)
@@ -309,21 +376,32 @@ def _evaluate_gemini(evidence_text: str) -> dict:
         + evidence_text
     )
 
-    try:
-        response = model.generate_content(user_message)
-        raw = response.text
-    except Exception as exc:
-        err = str(exc).lower()
-        if "api_key" in err or "invalid" in err or "403" in err or "api key" in err or "authentication" in err:
-            raise EvaluatorError(
-                "Gemini authentication failed. Check your GEMINI_API_KEY in .env."
-            ) from exc
-        if "quota" in err or "rate" in err or "429" in err or "resource_exhausted" in err:
-            raise EvaluatorError(
-                "Gemini rate limit reached. Wait a moment and retry, "
-                "or check your quota at https://aistudio.google.com."
-            ) from exc
-        raise EvaluatorError(f"Gemini API error: {exc}") from exc
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(user_message)
+            raw = response.text
+            break
+        except Exception as exc:
+            err = str(exc).lower()
+            if "api_key" in err or "invalid" in err or "403" in err or "api key" in err or "authentication" in err:
+                raise EvaluatorError(
+                    "Gemini authentication failed. Check your GEMINI_API_KEY in .env."
+                ) from exc
+            if "quota" in err or "rate" in err or "429" in err or "resource_exhausted" in err:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 20  # 20s, 40s, 60s
+                    logger.warning(f"Gemini rate limit hit. Waiting {wait_time}s before retry {attempt + 2}/{max_retries}...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise EvaluatorError(
+                        "Gemini rate limit reached. Wait a moment and retry, "
+                        "or check your quota at https://aistudio.google.com."
+                    ) from exc
+            raise EvaluatorError(f"Gemini API error: {exc}") from exc
+    else:
+        raise EvaluatorError("Gemini evaluation failed after all retries")
 
     if not raw:
         raise MalformedResponseError("Gemini returned an empty response.")
@@ -534,8 +612,8 @@ def _parse_llm_response(
     strengths = [str(s) for s in raw_json.get("strengths", []) if str(s).strip()]
     improvements = [str(i) for i in raw_json.get("improvements", []) if str(i).strip()]
     overall_rationale = str(raw_json.get("overall_rationale", "")).strip()
-    if not overall_rationale:
-        overall_rationale = "No overall rationale provided by the evaluator."
+    if not overall_rationale or overall_rationale.lower() in ["none", "n/a", "null"]:
+        overall_rationale = "No assessable dimensions were available for this recording. The content lacks sufficient speech or visual elements to evaluate teaching quality."
 
     raw_confidence = str(raw_json.get("confidence", "medium")).lower()
     try:
@@ -681,6 +759,8 @@ def evaluate(
                 raw_json = _evaluate_openai(evidence_text)
             elif settings.ai_provider == "gemini":
                 raw_json = _evaluate_gemini(evidence_text)
+            elif settings.ai_provider == "ollama":
+                raw_json = _evaluate_ollama(evidence_text)
             else:
                 raw_json = _evaluate_anthropic(evidence_text)
 
